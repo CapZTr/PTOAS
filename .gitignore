@@ -1,6 +1,8 @@
 # Build artifacts
 build/
+build-llvm19/
 install/
+install-llvm19/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
