@@ -220,7 +220,8 @@ process_one_dir() {
     ptobc_file="${out_subdir}/${base}.ptobc"
     decoded_pto="${out_subdir}/${base}-roundtrip.pto"
     if [[ $use_ptobc_roundtrip -eq 1 ]]; then
-      if ! "$ptobc" encode "$mlir" -o "$ptobc_file" >/dev/null 2>&1; then
+      # Allow generic escape for ops that are not yet in the compact v0 opcode table.
+      if ! PTOBC_ALLOW_GENERIC=1 "$ptobc" encode "$mlir" -o "$ptobc_file" >/dev/null 2>&1; then
         if [[ $expect_fail -eq 1 ]]; then
           echo -e "${A}(${base}.py)\tXFAIL\tptobc encode failed as expected"
           continue
@@ -357,15 +358,118 @@ process_one_dir() {
       fi
     fi
 
-    # Regression guard for Issue #190:
-    # Infer layout for a 2D column-vector view (16 x 1) should prefer DN.
-    if [[ "$base" == "tensor_view_infer_layout_dn" ]]; then
-      if ! grep -Eq "pto::Shape<1, 1, 1, 16, 1>.*pto::Layout::DN" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\texpected pto::Layout::DN for shape (16 x 1) GlobalTensor"
+    # Regression guard for Issue #207:
+    # SSA `pto.treshape` (lowered into `pto.bind_tile`) must lower to a single
+    # `TRESHAPE(dst, src)` instead of an invalid Tile-to-pointer cast sequence.
+    if [[ "$base" == "reshape" ]]; then
+      if ! grep -Fq "TRESHAPE(" "$cpp"; then
+        echo -e "${A}(${base}.py)	FAIL	missing TRESHAPE() lowering for SSA treshape"
+        overall=1
+        continue
+      fi
+      if grep -Eq "= \(__ubuf__ [^)]+\*\) v[0-9]+;" "$cpp"; then
+        echo -e "${A}(${base}.py)	FAIL	found invalid Tile-to-__ubuf__ pointer cast (issue #207)"
         overall=1
         continue
       fi
     fi
+
+    if [[ "$base" == "bitcast_dtype_alias" ]]; then
+      if ! grep -Eq "Tile<[^>]*, int32_t," "$cpp"; then
+        echo -e "${A}(${base}.py)	FAIL	missing int32_t Tile declaration for pto.bitcast"
+        overall=1
+        continue
+      fi
+      if [[ $(grep -c "TASSIGN(" "$cpp") -lt 3 ]]; then
+        echo -e "${A}(${base}.py)	FAIL	expected TASSIGN()-based alias lowering for pto.bitcast"
+        overall=1
+        continue
+      fi
+      if [[ $(grep -c "TRESHAPE(" "$cpp") -ne 0 ]]; then
+        echo -e "${A}(${base}.py)	FAIL	pto.bitcast should not lower via TRESHAPE()"
+        overall=1
+        continue
+      fi
+      if ! grep -Eq "(PTOAS__TILE_DATA|\.data\(\))" "$cpp"; then
+        echo -e "${A}(${base}.py)	FAIL	missing tile-address alias lowering for pto.bitcast"
+        overall=1
+        continue
+      fi
+    fi
+
+    # Regression guard for Issue #207 follow-up:
+    # `pto.bitcast` must alias the original tile storage via
+    # `TASSIGN(dst, reinterpret_cast<uint64_t>(src.data()))`.
+    if [[ "$base" == "bitcast_inplace_cvt" ]]; then
+      if ! "$python" - "$cpp" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], "r", encoding="utf-8").read()
+ptr_vars = {
+    match.group(1)
+    for match in re.finditer(r"\b(\w+)\s*=\s*\w+\.data\(\);", text)
+}
+addr_vars = {
+    match.group(1)
+    for match in re.finditer(
+        r"\b(\w+)\s*=\s*reinterpret_cast<uint64_t>\((\w+)\);", text
+    )
+    if match.group(2) in ptr_vars
+}
+ok = any(
+    re.search(rf"TASSIGN\([^,]+,\s*{re.escape(addr_var)}\);", text)
+    for addr_var in addr_vars
+)
+sys.exit(0 if ok else 1)
+PY
+      then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing aliasing TASSIGN() lowering for pto.bitcast"
+        overall=1
+        continue
+      fi
+    fi
+
+	    # Regression guard for Issue #190:
+	    # Infer layout for a 2D column-vector view (16 x 1) should prefer DN.
+	    if [[ "$base" == "tensor_view_infer_layout_dn" ]]; then
+	      if ! grep -Eq "pto::Shape<1, 1, 1, 16, 1>.*pto::Layout::DN" "$cpp"; then
+	        echo -e "${A}(${base}.py)\tFAIL\texpected pto::Layout::DN for shape (16 x 1) GlobalTensor"
+	        overall=1
+	        continue
+	      fi
+	    fi
+
+    # Regression guard for row-reduction kernels:
+    # (32 x 1) row-major outputs are minor-2D ambiguous; layout must align with
+    # row-major tiles (ND), otherwise pto-isa can hit layout/tile static_assert.
+    if [[ "$base" == "rowmin" || "$base" == "rowsum" || "$base" == "rowmax" ]]; then
+      if ! grep -Eq "pto::Shape<1, 1, 1, 32, 1>.*pto::Layout::ND" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\texpected pto::Layout::ND for shape (32 x 1) GlobalTensor"
+        overall=1
+        continue
+      fi
+      if grep -Eq "pto::Shape<1, 1, 1, 32, 1>.*pto::Layout::DN" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tunexpected pto::Layout::DN for shape (32 x 1) GlobalTensor"
+        overall=1
+        continue
+      fi
+    fi
+
+	    # Sync regression: InjectSync samples use `make_tensor_view` for GM.
+	    # They must not fall back to inferring a fractal (NZ) layout in C++.
+	    if [[ "$base" == "test_inject_sync_if" || \
+	          "$base" == "test_inject_sync_if_else" || \
+	          "$base" == "test_inject_sync_loop" || \
+	          "$base" == "test_inject_sync_loop_nest" || \
+	          "$base" == "test_inject_sync_two_event_id" || \
+	          "$base" == "test_mem_inject_sync_basic" ]]; then
+	      if grep -Fq "pto::Layout::NZ" "$cpp"; then
+	        echo -e "${A}(${base}.py)\tFAIL\tunexpected pto::Layout::NZ in emitted GlobalTensor"
+	        overall=1
+	        continue
+	      fi
+	    fi
 
     echo -e "${A}(${base}.py)\tOK\tgenerated: $(basename "$cpp")"
   done
@@ -392,7 +496,8 @@ process_one_dir() {
       cpp="${out_subdir}/${base}.cpp"
 
       if [[ $use_ptobc_roundtrip -eq 1 ]]; then
-        if ! "$ptobc" encode "$f" -o "$ptobc_file" >/dev/null 2>&1; then
+        # Allow generic escape for ops that are not yet in the compact v0 opcode table.
+        if ! PTOBC_ALLOW_GENERIC=1 "$ptobc" encode "$f" -o "$ptobc_file" >/dev/null 2>&1; then
           echo -e "${A}(${base}.pto)\tFAIL\tptobc encode failed: $(basename "$f")"
           overall=1
           continue

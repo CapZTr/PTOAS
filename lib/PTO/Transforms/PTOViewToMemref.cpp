@@ -1032,7 +1032,8 @@ struct PTOViewToMemrefPass
       // Stage 2.75: Lower SSA tile_buf view ops (pto.treshape / pto.bitcast)
       // ------------------------------------------------------------------
       auto lowerTileBufViewLike = [&](Operation *anchorOp, Value src,
-                                      mlir::pto::TileBufType tbTy) -> Value {
+                                      mlir::pto::TileBufType tbTy,
+                                      StringRef viewSemantics) -> Value {
         Location loc = anchorOp->getLoc();
         IRRewriter rewriter(ctx);
         rewriter.setInsertionPoint(anchorOp);
@@ -1089,6 +1090,9 @@ struct PTOViewToMemrefPass
         auto bindOp = rewriter.create<pto::BindTileOp>(
             loc, targetType, src,
             vRow ? vRow : Value(), vCol ? vCol : Value(), configAttr);
+        if (!viewSemantics.empty())
+          bindOp->setAttr("pto.view_semantics",
+                          rewriter.getStringAttr(viewSemantics));
         return bindOp.getResult();
       };
 
@@ -1096,14 +1100,14 @@ struct PTOViewToMemrefPass
       func.walk([&](mlir::pto::TReshapeOp op) { reshapes.push_back(op); });
 
       for (auto op : reshapes) {
-        Value src = op.getSrc();
-        auto tbTy = dyn_cast<mlir::pto::TileBufType>(op.getResult().getType());
+        Value src = op->getOperand(0);
+        auto tbTy = dyn_cast<mlir::pto::TileBufType>(op->getResult(0).getType());
         if (!tbTy) {
           op.emitError("treshape result must be tile_buf type");
           signalPassFailure();
           return;
         }
-        Value lowered = lowerTileBufViewLike(op, src, tbTy);
+        Value lowered = lowerTileBufViewLike(op, src, tbTy, "treshape");
         if (!lowered)
           return;
         IRRewriter rewriter(ctx);
@@ -1114,14 +1118,14 @@ struct PTOViewToMemrefPass
       func.walk([&](mlir::pto::BitcastOp op) { bitcasts.push_back(op); });
 
       for (auto op : bitcasts) {
-        Value src = op.getSrc();
-        auto tbTy = dyn_cast<mlir::pto::TileBufType>(op.getResult().getType());
+        Value src = op->getOperand(0);
+        auto tbTy = dyn_cast<mlir::pto::TileBufType>(op->getResult(0).getType());
         if (!tbTy) {
           op.emitError("bitcast result must be tile_buf type");
           signalPassFailure();
           return;
         }
-        Value lowered = lowerTileBufViewLike(op, src, tbTy);
+        Value lowered = lowerTileBufViewLike(op, src, tbTy, "bitcast");
         if (!lowered)
           return;
         IRRewriter rewriter(ctx);
@@ -1142,10 +1146,11 @@ struct PTOViewToMemrefPass
           
           Value src = op->getOperand(0); 
           Value dst = op->getOperand(1);
-          
-          auto config = lookupConfig(dst); // Config on Tile
 
-          rewriter.replaceOpWithNewOp<pto::TLoadOp>(op, TypeRange{}, src, dst);
+          auto newOp =
+              rewriter.create<pto::TLoadOp>(op.getLoc(), TypeRange{}, src, dst);
+          newOp->setAttrs(op->getAttrs());
+          rewriter.replaceOp(op, newOp->getResults());
       }
 
       // --- TStoreOp [Src, Dst] ---
@@ -1158,9 +1163,10 @@ struct PTOViewToMemrefPass
         Value src = op->getOperand(0); 
         Value dst = op->getOperand(1);
 
-        auto config = lookupConfig(src); // Config on Tile
-
-        rewriter.replaceOpWithNewOp<pto::TStoreOp>(op, TypeRange{}, src, dst);
+        auto newOp = rewriter.create<pto::TStoreOp>(op.getLoc(), TypeRange{},
+                                                    src, dst);
+        newOp->setAttrs(op->getAttrs());
+        rewriter.replaceOp(op, newOp->getResults());
       }
 
        // --- TTransOp [Src, Tmp, Dst] ---
@@ -1988,7 +1994,7 @@ struct PTOViewToMemrefPass
           return;
         }
 
-        auto newOp = rewriter.create<pto::GetValDpsOp>(
+        auto newOp = rewriter.create<pto::TGetValOp>(
             op.getLoc(),
             dstType,
             src,
