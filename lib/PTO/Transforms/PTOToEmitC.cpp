@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PTO/IR/PTO.h"
+#include "PTO/IR/PTOSyncUtils.h"
 #include "PTO/Transforms/Passes.h"
 
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
@@ -3632,7 +3633,13 @@ struct PTOGetBufToEmitC : public OpConversionPattern<mlir::pto::GetBufOp> {
     (void)adaptor;
     auto *ctx = rewriter.getContext();
 
-    std::string pipeTok = pipeTokFromPipeAttr(op.getPipe());
+    auto opTypeOr = parseSyncOpTypeLikeAttr(op.getOpTypeAttr());
+    if (failed(opTypeOr))
+      return rewriter.notifyMatchFailure(op, "get_buf expects pipe_event_type/sync_op_type attr");
+    auto pipe = mapSyncOpTypeToPipe(*opTypeOr);
+    if (!isConcreteSyncPipe(pipe))
+      return rewriter.notifyMatchFailure(op, "get_buf op_type cannot map to a concrete pipe");
+    std::string pipeTok = pipeTokFromPipeEnum(pipe);
     auto argsAttr = rewriter.getArrayAttr({
         emitc::OpaqueAttr::get(ctx, pipeTok),
         op.getBufIdAttr(),
@@ -3656,7 +3663,13 @@ struct PTORlsBufToEmitC : public OpConversionPattern<mlir::pto::RlsBufOp> {
     (void)adaptor;
     auto *ctx = rewriter.getContext();
 
-    std::string pipeTok = pipeTokFromPipeAttr(op.getPipe());
+    auto opTypeOr = parseSyncOpTypeLikeAttr(op.getOpTypeAttr());
+    if (failed(opTypeOr))
+      return rewriter.notifyMatchFailure(op, "rls_buf expects pipe_event_type/sync_op_type attr");
+    auto pipe = mapSyncOpTypeToPipe(*opTypeOr);
+    if (!isConcreteSyncPipe(pipe))
+      return rewriter.notifyMatchFailure(op, "rls_buf op_type cannot map to a concrete pipe");
+    std::string pipeTok = pipeTokFromPipeEnum(pipe);
     auto argsAttr = rewriter.getArrayAttr({
         emitc::OpaqueAttr::get(ctx, pipeTok),
         op.getBufIdAttr(),

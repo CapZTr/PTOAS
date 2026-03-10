@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PTO/IR/PTO.h"
+#include "PTO/IR/PTOSyncUtils.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -1973,14 +1974,21 @@ LogicalResult StoreScalarOp::verify() {
 }
 
 // ---- GetBufOp / RlsBufOp ----
-static LogicalResult verifyBufSyncOp(Operation *op, PipeAttr pipeAttr,
+static LogicalResult verifyBufSyncOp(Operation *op, Attribute opTypeAttr,
                                      IntegerAttr bufIdAttr, IntegerAttr modeAttr) {
-  if (!pipeAttr)
-    return op->emitOpError("expects 'pipe' attribute");
+  if (!opTypeAttr)
+    return op->emitOpError("expects 'op_type' attribute");
 
-  pto::PIPE pipe = pipeAttr.getPipe();
-  if (pipe == pto::PIPE::PIPE_ALL || pipe == pto::PIPE::PIPE_UNASSIGNED)
-    return op->emitOpError("expects 'pipe' to be a concrete pipe, not PIPE_ALL/PIPE_UNASSIGNED");
+  auto opTypeOr = parseSyncOpTypeLikeAttr(opTypeAttr);
+  if (failed(opTypeOr)) {
+    auto diag =
+        op->emitOpError("expects 'op_type' to be pipe_event_type/sync_op_type, got ");
+    diag << opTypeAttr;
+    return failure();
+  }
+  pto::PIPE pipe = mapSyncOpTypeToPipe(*opTypeOr);
+  if (!isConcreteSyncPipe(pipe))
+    return op->emitOpError("expects 'op_type' to map to a concrete pipe, not PIPE_ALL/PIPE_UNASSIGNED");
 
   if (!bufIdAttr)
     return op->emitOpError("expects 'buf_id' attribute");
@@ -1998,12 +2006,12 @@ static LogicalResult verifyBufSyncOp(Operation *op, PipeAttr pipeAttr,
 }
 
 LogicalResult GetBufOp::verify() {
-  return verifyBufSyncOp(getOperation(), getPipe(), getBufIdAttr(),
+  return verifyBufSyncOp(getOperation(), getOpTypeAttr(), getBufIdAttr(),
                          getModeAttr());
 }
 
 LogicalResult RlsBufOp::verify() {
-  return verifyBufSyncOp(getOperation(), getPipe(), getBufIdAttr(),
+  return verifyBufSyncOp(getOperation(), getOpTypeAttr(), getBufIdAttr(),
                          getModeAttr());
 }
 // ---- TOp ----
