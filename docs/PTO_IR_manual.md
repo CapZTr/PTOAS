@@ -491,23 +491,23 @@ result = source[offsets] with static sizes
 
 ### 4.2 Buffer-ID Token Operations (A5)
 
-The following operations implement a **buffer-id based ordering model** for the A5 architecture: acquire and release a buffer-id token on a given pipeline so that operations guarded by the same buffer-id execute in program order across pipes. They lower to the CCEC builtins `get_buf` and `rls_buf`.
+The following operations implement a **buffer-id based ordering model** for the A5 architecture: acquire and release a buffer-id token by high-level sync op type (the op type is mapped to a concrete pipe internally), so that operations guarded by the same buffer-id execute in program order across mapped pipes. They lower to the CCEC builtins `get_buf` and `rls_buf`.
 
 ##### `pto.get_buf` - Acquire Buffer-ID Token (A5)
 
-**Summary:** Acquires a buffer-id token on a given pipeline. Used in a buffer-id based ordering model: operations on the same pipe that share the same buffer-id are enforced to execute in program order relative to other pipes using the same buffer-id.
+**Summary:** Acquires a buffer-id token for a sync op type (`pipe_event_type` / `sync_op_type`). Used in a buffer-id based ordering model: operations on the mapped pipe that share the same buffer-id are enforced to execute in program order relative to other mapped pipes using the same buffer-id.
 
 **Semantics:**
 
 ```
-get_buf(pipe, buf_id [, mode])
+get_buf(op_type, buf_id [, mode])
 ```
 
 **Arguments:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `pipe` | `PipeAttr` | Pipeline on which to acquire the token |
+| `op_type` | `PipeEventTypeAttr` / `SyncOpTypeAttr` | High-level sync op type (mapped to concrete pipe) |
 | `buf_id` | `I32Attr` | Buffer ID (token identifier) |
 | `mode` | `I32Attr` (default: 0) | Optional mode (attribute) |
 
@@ -524,27 +524,27 @@ get_buf(pipe, buf_id [, mode])
 **Basic Example:**
 
 ```mlir
-pto.get_buf [#pto.pipe<PIPE_V>, 0]
-pto.get_buf [#pto.pipe<PIPE_M>, 1] { mode = 0 }
+pto.get_buf [#pto.pipe_event_type<TVEC>, 0]
+pto.get_buf [#pto.pipe_event_type<TMATMUL>, 1] { mode = 0 }
 ```
 
 ---
 
 ##### `pto.rls_buf` - Release Buffer-ID Token (A5)
 
-**Summary:** Releases a previously acquired buffer-id token on a given pipeline. Used in conjunction with `pto.get_buf`: after operations that were ordered under the same buffer-id complete, `rls_buf` releases the token for that pipe and buffer-id.
+**Summary:** Releases a previously acquired buffer-id token for a sync op type. Used in conjunction with `pto.get_buf`: after operations that were ordered under the same buffer-id complete, `rls_buf` releases the token for that mapped pipe and buffer-id.
 
 **Semantics:**
 
 ```
-rls_buf(pipe, buf_id [, mode])
+rls_buf(op_type, buf_id [, mode])
 ```
 
 **Arguments:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `pipe` | `PipeAttr` | Pipeline on which to release the token |
+| `op_type` | `PipeEventTypeAttr` / `SyncOpTypeAttr` | High-level sync op type (mapped to concrete pipe) |
 | `buf_id` | `I32Attr` | Buffer ID (must match a prior `pto.get_buf`) |
 | `mode` | `I32Attr` (default: 0) | Optional mode (attribute) |
 
@@ -561,10 +561,10 @@ rls_buf(pipe, buf_id [, mode])
 **Basic Example:**
 
 ```mlir
-pto.get_buf [#pto.pipe<PIPE_V>, 0]
+pto.get_buf [#pto.pipe_event_type<TVEC>, 0]
 // ... operations under buffer-id 0 ...
-pto.rls_buf [#pto.pipe<PIPE_V>, 0]
-pto.rls_buf [#pto.pipe<PIPE_M>, 1] { mode = 0 }
+pto.rls_buf [#pto.pipe_event_type<TVEC>, 0]
+pto.rls_buf [#pto.pipe_event_type<TMATMUL>, 1] { mode = 0 }
 ```
 
 ---
@@ -697,7 +697,7 @@ value = ptr[offset]
 
 **Hardware Mapping:**
 
-- Scalar load from global or local memory
+- Scalar load from global
 
 **Basic Example:**
 
@@ -734,7 +734,7 @@ ptr[offset] = value
 
 **Hardware Mapping:**
 
-- Scalar store to global or local memory
+- Scalar store to global memory space.
 
 **Basic Example:**
 
@@ -1825,7 +1825,7 @@ For each element (i, j):
 | Name | Type | Description |
 |------|------|-------------|
 | `src` | `pto.tile_buf` | Source tile buffer containing the input data |
-| `scalar` | `AnyType` (e.g. `f32`, `f16`) | Scalar value to add to each element |
+| `scalar` | `ScalarType` (`index` / integer / float) | Scalar value to add to each element |
 | `dst` | `pto.tile_buf` | Destination tile buffer for the result |
 
 **Results:** None. The operation writes results into `dst` following the Destination-Passing Style (DPS) pattern.
@@ -1841,8 +1841,7 @@ pto.tadds ins(<src>, <scalar> : <src_type>, <scalar_type>)
 
 - The operation has a custom verifier that checks:
   - `src` and `dst` must have same shapes and element types
-  - `scalar` type must be compatible with the element type of the tile buffers
-- Tile operands are `tile_buf` types; scalar is a builtin scalar type (e.g. `f32`)
+  - `scalar` must be a scalar type (`index` / integer / float)
 
 **Hardware Mapping:**
 
@@ -1879,8 +1878,8 @@ For each element (i, j):
 | Name | Type | Description |
 |------|------|-------------|
 | `src` | `pto.tile_buf` | Source tile buffer |
-| `scalar` | `F32` | Scalar value to subtract |
-| `dst` | `pto.tile_buf` | Destination tile buffer |
+| `scalar` | `ScalarType` (`index` / integer / float) | Scalar value to subtract |
+| `dst` | `pto.tile_buf` | Destination tile buffer for the result |
 
 **Results:** None. Writes into `dst` via DPS pattern.
 
@@ -1895,7 +1894,7 @@ pto.tsubs ins(<src>, <scalar> : <src_type>, <scalar_type>)
 
 - The operation has a custom verifier that checks:
   - `src` and `dst` must have same shapes and element types
-  - Tile operands are `tile_buf` types; scalar is a builtin scalar type (currently `f32`)
+  - `scalar` must be a scalar type (`index` / integer / float)
 
 **Hardware Mapping:**
 
@@ -4587,6 +4586,43 @@ For padded elements: dst = PadVal(dst)
 
 ```mlir
 pto.tfillpad ins(%src : !pto.tile_buf<...>) outs(%dst : !pto.tile_buf<...>)
+```
+
+---
+
+##### `pto.tfillpad_expand` - Fill Padding Region With Expand
+
+**Summary:** Copies `src` into `dst` and fills padded elements using `dst`'s PadVal, allowing `dst` to be larger than `src`.
+
+**Semantics:**
+
+```
+For valid elements: dst = src
+For padded elements: dst = PadVal(dst)
+Constraint: dst.rows >= src.rows and dst.cols >= src.cols
+```
+
+**Arguments:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `src` | `pto.tile_buf` | Source tile |
+| `dst` | `pto.tile_buf` | Destination tile (with pad config, may be larger) |
+
+**Results:** None. Writes into `dst` via DPS pattern.
+
+**Constraints & Verification:**
+
+- The operation has a custom verifier
+
+**Hardware Mapping:**
+
+- Executes on the **Vector pipeline** (`PIPE_V`)
+
+**Basic Example:**
+
+```mlir
+pto.tfillpad_expand ins(%src : !pto.tile_buf<...>) outs(%dst : !pto.tile_buf<...>)
 ```
 
 ---

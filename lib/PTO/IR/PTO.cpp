@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PTO/IR/PTO.h"
+#include "PTO/IR/PTOSyncUtils.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -1011,8 +1012,8 @@ LogicalResult pto::TAddSOp::verify() {
     return emitOpError("src and dst shape must match");
 
   Type scalarTy = getScalar().getType();
-  if (scalarTy != elem)
-    return emitOpError("scalar type must equal src/dst element type");
+  if (!scalarTy.isa<IndexType, IntegerType, FloatType>())
+    return emitOpError("scalar must be a scalar type (index/integer/float)");
 
   auto isOK = [&](Type t) -> bool {
     if (auto it = t.dyn_cast<IntegerType>()) {
@@ -1530,16 +1531,16 @@ mlir::LogicalResult mlir::pto::TExtractOp::verify() {
 // TFillPadOp_DPS verifier
 //===----------------------------------------------------------------------===//
 
-mlir::LogicalResult mlir::pto::TFillPadOp::verify() {
-  Type srcTy = getSrc().getType();
-  Type dstTy = getDst().getType();
+static mlir::LogicalResult verifyTFillPadLike(Operation *op, Type srcTy, Type dstTy,
+                                              bool allowDstExpand,
+                                              llvm::StringRef opName) {
   if (!isPTOShapedLike(srcTy) || !isPTOShapedLike(dstTy))
-    return emitOpError("expects src/dst to be PTO shaped-like types");
+    return op->emitError("expects src/dst to be PTO shaped-like types");
 
   auto srcShape = getShapeVec(srcTy);
   auto dstShape = getShapeVec(dstTy);
   if (srcShape.size() != 2 || dstShape.size() != 2)
-    return emitOpError("expects rank-2 shaped types for src/dst");
+    return op->emitError("expects rank-2 shaped types for src/dst");
 
   auto srcElem = getElemTy(srcTy);
   auto dstElem = getElemTy(dstTy);
@@ -1555,17 +1556,41 @@ mlir::LogicalResult mlir::pto::TFillPadOp::verify() {
   int64_t srcB = getElemBytes(srcElem);
   int64_t dstB = getElemBytes(dstElem);
   if (srcB < 0 || dstB < 0)
-    return emitOpError("unsupported element type (expects int/float element types)");
+    return op->emitError("unsupported element type (expects int/float element types)");
   if (srcB != dstB)
-    return emitOpError("expects sizeof(src element) == sizeof(dst element)");
+    return op->emitError("expects sizeof(src element) == sizeof(dst element)");
   if (!(srcB == 1 || srcB == 2 || srcB == 4))
-    return emitOpError("expects element size to be 1, 2, or 4 bytes");
+    return op->emitError("expects element size to be 1, 2, or 4 bytes");
 
-  if (srcShape != dstShape)
-    return emitOpError("expects src and dst to have the same static shape for tfillpad");
-  
+  if (auto dstTileTy = mlir::dyn_cast<mlir::pto::TileBufType>(dstTy)) {
+    auto padAttr = mlir::dyn_cast<mlir::pto::PadValueAttr>(dstTileTy.getPadValueAttr());
+    if (!padAttr || padAttr.getValue() == mlir::pto::PadValue::Null)
+      return op->emitError() << "expects dst PadVal != Null for " << opName;
+  }
+
+  if (!allowDstExpand) {
+    if (srcShape != dstShape)
+      return op->emitError()
+             << "expects src and dst to have the same static shape for " << opName;
+    return mlir::success();
+  }
+
+  if (srcShape[0] > dstShape[0] || srcShape[1] > dstShape[1]) {
+    return op->emitError()
+           << "expects dst static shape to be >= src static shape for " << opName;
+  }
 
   return mlir::success();
+}
+
+mlir::LogicalResult mlir::pto::TFillPadOp::verify() {
+  return verifyTFillPadLike(getOperation(), getSrc().getType(), getDst().getType(),
+                            /*allowDstExpand=*/false, "tfillpad");
+}
+
+mlir::LogicalResult mlir::pto::TFillPadExpandOp::verify() {
+  return verifyTFillPadLike(getOperation(), getSrc().getType(), getDst().getType(),
+                            /*allowDstExpand=*/true, "tfillpad_expand");
 }
 //===----------------------------------------------------------------------===//
 // TGatherOp_DPS verifier
@@ -1973,14 +1998,21 @@ LogicalResult StoreScalarOp::verify() {
 }
 
 // ---- GetBufOp / RlsBufOp ----
-static LogicalResult verifyBufSyncOp(Operation *op, PipeAttr pipeAttr,
+static LogicalResult verifyBufSyncOp(Operation *op, Attribute opTypeAttr,
                                      IntegerAttr bufIdAttr, IntegerAttr modeAttr) {
-  if (!pipeAttr)
-    return op->emitOpError("expects 'pipe' attribute");
+  if (!opTypeAttr)
+    return op->emitOpError("expects 'op_type' attribute");
 
-  pto::PIPE pipe = pipeAttr.getPipe();
-  if (pipe == pto::PIPE::PIPE_ALL || pipe == pto::PIPE::PIPE_UNASSIGNED)
-    return op->emitOpError("expects 'pipe' to be a concrete pipe, not PIPE_ALL/PIPE_UNASSIGNED");
+  auto opTypeOr = parseSyncOpTypeLikeAttr(opTypeAttr);
+  if (failed(opTypeOr)) {
+    auto diag =
+        op->emitOpError("expects 'op_type' to be pipe_event_type/sync_op_type, got ");
+    diag << opTypeAttr;
+    return failure();
+  }
+  pto::PIPE pipe = mapSyncOpTypeToPipe(*opTypeOr);
+  if (!isConcreteSyncPipe(pipe))
+    return op->emitOpError("expects 'op_type' to map to a concrete pipe, not PIPE_ALL/PIPE_UNASSIGNED");
 
   if (!bufIdAttr)
     return op->emitOpError("expects 'buf_id' attribute");
@@ -1998,12 +2030,12 @@ static LogicalResult verifyBufSyncOp(Operation *op, PipeAttr pipeAttr,
 }
 
 LogicalResult GetBufOp::verify() {
-  return verifyBufSyncOp(getOperation(), getPipe(), getBufIdAttr(),
+  return verifyBufSyncOp(getOperation(), getOpTypeAttr(), getBufIdAttr(),
                          getModeAttr());
 }
 
 LogicalResult RlsBufOp::verify() {
-  return verifyBufSyncOp(getOperation(), getPipe(), getBufIdAttr(),
+  return verifyBufSyncOp(getOperation(), getOpTypeAttr(), getBufIdAttr(),
                          getModeAttr());
 }
 // ---- TOp ----
@@ -2042,6 +2074,21 @@ LogicalResult TGetValOp::verify() {
   Type srcTy = getSrc().getType();
   if (!srcTy.isa<pto::TileBufType, MemRefType>())
     return emitOpError("expects src to be tile_buf or memref type");
+
+  // Memory space must be vec (Ascend does not support getval from MAT etc.).
+  Attribute memSpace =
+      isa<pto::TileBufType>(srcTy)
+          ? cast<pto::TileBufType>(srcTy).getMemorySpace()
+          : cast<MemRefType>(srcTy).getMemorySpace();
+  auto addrSpaceAttr = dyn_cast_or_null<pto::AddressSpaceAttr>(memSpace);
+  if (!addrSpaceAttr ||
+      addrSpaceAttr.getAddressSpace() != pto::AddressSpace::VEC) {
+    if (addrSpaceAttr &&
+        addrSpaceAttr.getAddressSpace() == pto::AddressSpace::MAT)
+      return emitOpError(
+          "Ascend hardware does not support reading from Mat tile_buf to Scalar unit");
+    return emitOpError("expects src memory space to be vec");
+  }
 
   if (getElemTy(srcTy) != getDst().getType())
     return emitOpError("expects dst type to match src element type");
@@ -2510,17 +2557,27 @@ mlir::LogicalResult mlir::pto::TPartMinOp::verify() {
 mlir::LogicalResult mlir::pto::TPReluOp::verify() {
   Type t0 = getSrc0().getType();
   Type t1 = getSrc1().getType();
+  Type tt = getTmp().getType();
   Type td = getDst().getType();
-  if (!isPTOShapedLike(t0) || !isPTOShapedLike(t1) || !isPTOShapedLike(td))
-    return emitOpError("expects src0/src1/dst to be memref/tensor/tile_buf/tile_view types");
-  Type e0 = getElemTy(t0), e1 = getElemTy(t1), ed = getElemTy(td);
-  if (!e0 || !e1 || !ed)
+  if (!isPTOShapedLike(t0) || !isPTOShapedLike(t1) || !isPTOShapedLike(tt) ||
+      !isPTOShapedLike(td))
+    return emitOpError(
+        "expects src0/src1/tmp/dst to be memref/tensor/tile_buf/tile_view types");
+  Type e0 = getElemTy(t0), e1 = getElemTy(t1), et = getElemTy(tt), ed = getElemTy(td);
+  if (!e0 || !e1 || !et || !ed)
     return emitOpError("failed to get element type for operands");
+  // TPRELU C++ API (TPreluCheck): dst/src0/src1 same type (half or float); tmp must be uint8_t.
   if (e0 != e1 || e0 != ed)
-    return emitOpError("expects src0/src1/dst to have the same element type");
-  auto s0 = getShapeVec(t0), s1 = getShapeVec(t1), sd = getShapeVec(td);
-  if (s0 != s1 || s0 != sd)
-    return emitOpError("expects src0/src1/dst to have the same shape");
+    return emitOpError("expects src0/src1/dst to have the same element type (f16 or f32)");
+  if (!e0.isa<FloatType>() || (!e0.isF16() && !e0.isF32()))
+    return emitOpError("expects src0/src1/dst element type to be f16 or f32");
+  auto intTy = et.dyn_cast<IntegerType>();
+  if (!intTy || intTy.getWidth() != 8 || !intTy.isUnsigned())
+    return emitOpError("expects tmp to have element type uint8 (unsigned 8-bit integer)");
+  auto s0 = getShapeVec(t0), s1 = getShapeVec(t1), st = getShapeVec(tt),
+       sd = getShapeVec(td);
+  if (s0 != s1 || s0 != st || s0 != sd)
+    return emitOpError("expects src0/src1/tmp/dst to have the same shape");
   return mlir::success();
 }
 //===----------------------------------------------------------------------===//
@@ -3144,6 +3201,10 @@ mlir::LogicalResult mlir::pto::TSubSOp::verify() {
 
   if (getElemTy(srcTy) != getElemTy(dstTy))
     return emitOpError() << "expects src and dst to have the same element type";
+
+  Type scalarTy = getScalar().getType();
+  if (!scalarTy.isa<IndexType, IntegerType, FloatType>())
+    return emitOpError("scalar must be a scalar type (index/integer/float)");
 
   return mlir::success();
 }
@@ -4222,6 +4283,7 @@ void TExtractOp::getEffects(
 }
 
 PTO_DEFINE_UNARY_EFFECTS(TFillPadOp, getSrcMutable(), getDstMutable())
+PTO_DEFINE_UNARY_EFFECTS(TFillPadExpandOp, getSrcMutable(), getDstMutable())
 
 void TGatherOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects) {
@@ -4268,7 +4330,14 @@ PTO_DEFINE_UNARY_EFFECTS(TOrSOp, getSrcMutable(), getDstMutable())
 PTO_DEFINE_BINARY_EFFECTS(TPartAddOp, getSrc0Mutable(), getSrc1Mutable(), getDstMutable())
 PTO_DEFINE_BINARY_EFFECTS(TPartMaxOp, getSrc0Mutable(), getSrc1Mutable(), getDstMutable())
 PTO_DEFINE_BINARY_EFFECTS(TPartMinOp, getSrc0Mutable(), getSrc1Mutable(), getDstMutable())
-PTO_DEFINE_BINARY_EFFECTS(TPReluOp, getSrc0Mutable(), getSrc1Mutable(), getDstMutable())
+// TPRELU: Read(src0, src1) -> Write(tmp, dst)
+void TPReluOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects) {
+  PTO_ADD_READ(getSrc0Mutable());
+  PTO_ADD_READ(getSrc1Mutable());
+  PTO_ADD_WRITE(getTmpMutable());
+  PTO_ADD_WRITE(getDstMutable());
+}
 
 PTO_DEFINE_UNARY_EFFECTS(TRecipOp, getSrcMutable(), getDstMutable())
 PTO_DEFINE_UNARY_EFFECTS(TReluOp, getSrcMutable(), getDstMutable())

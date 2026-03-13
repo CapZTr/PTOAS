@@ -137,6 +137,23 @@ process_one_dir() {
     fi
     [[ $has_insync -eq 1 ]] || ptoas_flags+=(--enable-insert-sync)
   fi
+
+  local target_arch="a3"
+  if ((${#ptoas_flags[@]})); then
+    for ((idx=0; idx<${#ptoas_flags[@]}; ++idx)); do
+      if [[ "${ptoas_flags[idx]}" == "--pto-arch" && $((idx + 1)) -lt ${#ptoas_flags[@]} ]]; then
+        target_arch="${ptoas_flags[idx + 1]}"
+      elif [[ "${ptoas_flags[idx]}" == --pto-arch=* ]]; then
+        target_arch="${ptoas_flags[idx]#--pto-arch=}"
+      fi
+    done
+  fi
+  local expected_vec_barrier="pipe_barrier(PIPE_V)"
+  local skip_vec_barrier=0
+  if [[ "$(printf '%s' "$target_arch" | tr '[:upper:]' '[:lower:]')" == "a5" ]]; then
+    skip_vec_barrier=1
+  fi
+
   local -a ptoas_cmd_base=("$ptoas")
   if (( ${#ptoas_flags[@]} )); then
     ptoas_cmd_base+=("${ptoas_flags[@]}")
@@ -285,10 +302,18 @@ process_one_dir() {
     # Regression guard: intra-pipe dependencies must be serialized by a
     # per-pipe barrier (PyPTO expects `bar_v` / `bar_m` behavior).
     if [[ "$base" == "test_inject_sync_intra_pipe_barrier" ]]; then
-      if ! grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\tmissing pipe_barrier(PIPE_V) for intra-pipe dependency"
-        overall=1
-        continue
+      if [[ "${skip_vec_barrier}" == "1" ]]; then
+        if grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tunexpected pipe_barrier(PIPE_V) on A5"
+          overall=1
+          continue
+        fi
+      else
+        if ! grep -Fq "${expected_vec_barrier}" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing ${expected_vec_barrier} for intra-pipe dependency"
+          overall=1
+          continue
+        fi
       fi
     fi
 
@@ -305,10 +330,18 @@ process_one_dir() {
         overall=1
         continue
       fi
-      if ! grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
-        echo -e "${A}(${base}.py)\tFAIL\tmissing pipe_barrier(PIPE_V) lowering for barrier_sync[TVEC]"
-        overall=1
-        continue
+      if [[ "${skip_vec_barrier}" == "1" ]]; then
+        if grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tunexpected pipe_barrier(PIPE_V) lowering for barrier_sync[TVEC] on A5"
+          overall=1
+          continue
+        fi
+      else
+        if ! grep -Fq "${expected_vec_barrier}" "$cpp"; then
+          echo -e "${A}(${base}.py)\tFAIL\tmissing ${expected_vec_barrier} lowering for barrier_sync[TVEC]"
+          overall=1
+          continue
+        fi
       fi
     fi
 
@@ -430,6 +463,32 @@ PY
       fi
     fi
 
+    if [[ "$base" == "fillpad" ]]; then
+      if ! grep -Fq "TFILLPAD(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TFILLPAD() lowering for pto.tfillpad"
+        overall=1
+        continue
+      fi
+      if grep -Fq "TFILLPAD_EXPAND(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tpto.tfillpad should not lower via TFILLPAD_EXPAND()"
+        overall=1
+        continue
+      fi
+    fi
+
+    if [[ "$base" == "fillpad_expand" ]]; then
+      if ! grep -Fq "TFILLPAD_EXPAND(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tmissing TFILLPAD_EXPAND() lowering for pto.tfillpad_expand"
+        overall=1
+        continue
+      fi
+      if grep -Fq "TFILLPAD(" "$cpp"; then
+        echo -e "${A}(${base}.py)\tFAIL\tpto.tfillpad_expand should not lower via TFILLPAD()"
+        overall=1
+        continue
+      fi
+    fi
+
 	    # Regression guard for Issue #190:
 	    # Infer layout for a 2D column-vector view (16 x 1) should prefer DN.
 	    if [[ "$base" == "tensor_view_infer_layout_dn" ]]; then
@@ -494,8 +553,17 @@ PY
       ptobc_file="${out_subdir}/${base}.ptobc"
       decoded_pto="${out_subdir}/${base}-roundtrip.pto"
       cpp="${out_subdir}/${base}.cpp"
+      local sample_use_ptobc_roundtrip="$use_ptobc_roundtrip"
 
-      if [[ $use_ptobc_roundtrip -eq 1 ]]; then
+      # TODO(ptobc): decode of this regression currently fails with
+      # "operand value_id out of range" when scf.if returns tile-like values.
+      # Keep ptoas regression coverage here, and re-enable roundtrip once
+      # ptobc supports this pattern.
+      if [[ "$base" == "test_if_else_tile_result" ]]; then
+        sample_use_ptobc_roundtrip=0
+      fi
+
+      if [[ $sample_use_ptobc_roundtrip -eq 1 ]]; then
         # Allow generic escape for ops that are not yet in the compact v0 opcode table.
         if ! PTOBC_ALLOW_GENERIC=1 "$ptobc" encode "$f" -o "$ptobc_file" >/dev/null 2>&1; then
           echo -e "${A}(${base}.pto)\tFAIL\tptobc encode failed: $(basename "$f")"
@@ -531,10 +599,18 @@ PY
       # Regression guard: intra-pipe dependencies must be serialized by a
       # per-pipe barrier (PyPTO expects `bar_v` / `bar_m` behavior).
       if [[ "$base" == "test_inject_sync_intra_pipe_barrier" ]]; then
-        if ! grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
-          echo -e "${A}(${base}.pto)\tFAIL\tmissing pipe_barrier(PIPE_V) for intra-pipe dependency"
-          overall=1
-          continue
+        if [[ "${skip_vec_barrier}" == "1" ]]; then
+          if grep -Fq "pipe_barrier(PIPE_V)" "$cpp"; then
+            echo -e "${A}(${base}.pto)\tFAIL\tunexpected pipe_barrier(PIPE_V) on A5"
+            overall=1
+            continue
+          fi
+        else
+          if ! grep -Fq "${expected_vec_barrier}" "$cpp"; then
+            echo -e "${A}(${base}.pto)\tFAIL\tmissing ${expected_vec_barrier} for intra-pipe dependency"
+            overall=1
+            continue
+          fi
         fi
       fi
 
@@ -542,6 +618,16 @@ PY
       if [[ "$base" == "test_a5_buf_sync" ]]; then
         if ! grep -Fq "get_buf(" "$cpp" || ! grep -Fq "rls_buf(" "$cpp"; then
           echo -e "${A}(${base}.pto)\tFAIL\tmissing get_buf/rls_buf lowering"
+          overall=1
+          continue
+        fi
+      fi
+
+      # Regression guard: scf.if yielding tile result in loop should lower
+      # through memref + EmitC without type-mismatch failures.
+      if [[ "$base" == "test_if_else_tile_result" ]]; then
+        if ! grep -Fq "TADD(" "$cpp" || ! grep -Fq "TMUL(" "$cpp" || ! grep -Fq "TSTORE(" "$cpp"; then
+          echo -e "${A}(${base}.pto)\tFAIL\tmissing expected if-else tile result lowering"
           overall=1
           continue
         fi

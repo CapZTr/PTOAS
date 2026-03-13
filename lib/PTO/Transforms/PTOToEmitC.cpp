@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PTO/IR/PTO.h"
+#include "PTO/IR/PTOSyncUtils.h"
 #include "PTO/Transforms/Passes.h"
 
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
@@ -38,6 +39,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"                   
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 
@@ -3632,7 +3634,13 @@ struct PTOGetBufToEmitC : public OpConversionPattern<mlir::pto::GetBufOp> {
     (void)adaptor;
     auto *ctx = rewriter.getContext();
 
-    std::string pipeTok = pipeTokFromPipeAttr(op.getPipe());
+    auto opTypeOr = parseSyncOpTypeLikeAttr(op.getOpTypeAttr());
+    if (failed(opTypeOr))
+      return rewriter.notifyMatchFailure(op, "get_buf expects pipe_event_type/sync_op_type attr");
+    auto pipe = mapSyncOpTypeToPipe(*opTypeOr);
+    if (!isConcreteSyncPipe(pipe))
+      return rewriter.notifyMatchFailure(op, "get_buf op_type cannot map to a concrete pipe");
+    std::string pipeTok = pipeTokFromPipeEnum(pipe);
     auto argsAttr = rewriter.getArrayAttr({
         emitc::OpaqueAttr::get(ctx, pipeTok),
         op.getBufIdAttr(),
@@ -3656,7 +3664,13 @@ struct PTORlsBufToEmitC : public OpConversionPattern<mlir::pto::RlsBufOp> {
     (void)adaptor;
     auto *ctx = rewriter.getContext();
 
-    std::string pipeTok = pipeTokFromPipeAttr(op.getPipe());
+    auto opTypeOr = parseSyncOpTypeLikeAttr(op.getOpTypeAttr());
+    if (failed(opTypeOr))
+      return rewriter.notifyMatchFailure(op, "rls_buf expects pipe_event_type/sync_op_type attr");
+    auto pipe = mapSyncOpTypeToPipe(*opTypeOr);
+    if (!isConcreteSyncPipe(pipe))
+      return rewriter.notifyMatchFailure(op, "rls_buf op_type cannot map to a concrete pipe");
+    std::string pipeTok = pipeTokFromPipeEnum(pipe);
     auto argsAttr = rewriter.getArrayAttr({
         emitc::OpaqueAttr::get(ctx, pipeTok),
         op.getBufIdAttr(),
@@ -4729,13 +4743,37 @@ struct PTOExtractToEmitC : public OpConversionPattern<pto::TExtractOp> {
   }
 };
 //===----------------------------------------------------------------------===//
-// pto.tfillpad lowering -> TFILLPAD_EXPAND(dst, src)
+// pto.tfillpad lowering -> TFILLPAD(dst, src)
 //===----------------------------------------------------------------------===//
 
 struct PTOFillPadToEmitC : public OpConversionPattern<pto::TFillPadOp> {
   using OpConversionPattern<pto::TFillPadOp>::OpConversionPattern;
 
   LogicalResult matchAndRewrite(pto::TFillPadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    Value src = peelUnrealized(adaptor.getSrc());
+    Value dst = peelUnrealized(adaptor.getDst());
+
+    rewriter.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{}, "TFILLPAD",
+        /*args=*/ArrayAttr{}, /*templateArgs=*/ArrayAttr{},
+        /*operands=*/ValueRange{dst, src});
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+//===----------------------------------------------------------------------===//
+// pto.tfillpad_expand lowering -> TFILLPAD_EXPAND(dst, src)
+//===----------------------------------------------------------------------===//
+
+struct PTOFillPadExpandToEmitC
+    : public OpConversionPattern<pto::TFillPadExpandOp> {
+  using OpConversionPattern<pto::TFillPadExpandOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(pto::TFillPadExpandOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
 
@@ -5385,11 +5423,11 @@ struct PTOPreluToEmitC : public OpConversionPattern<pto::TPReluOp> {
 
     Value src0 = peelUnrealized(adaptor.getSrc0());
     Value src1 = peelUnrealized(adaptor.getSrc1());
+    Value tmp  = peelUnrealized(adaptor.getTmp());
     Value dst  = peelUnrealized(adaptor.getDst());
 
-    // pto-isa TPRELU requires a tmp tile argument. Current NPU implementation
-    // does not use tmp, so we safely pass dst as tmp for compatibility.
-    SmallVector<Value, 4> operands{dst, src0, src1, dst};
+    // C++ interface: TPRELU(dst, src0, src1, tmp) — last parameter is tmp.
+    SmallVector<Value, 4> operands{dst, src0, src1, tmp};
     rewriter.create<emitc::CallOpaqueOp>(
         loc, TypeRange{}, "TPRELU",
         /*args=*/ArrayAttr{}, /*templateArgs=*/ArrayAttr{},
@@ -7261,7 +7299,7 @@ static void populatePTOToEmitCPatterns(RewritePatternSet &patterns,
   patterns.add<PTOOrToEmitC>(typeConverter, ctx);
   patterns.add<PTOPartAddToEmitC>(typeConverter, ctx);
   patterns.add<PTOExtractToEmitC>(typeConverter, ctx);
-  patterns.add<PTOFillPadToEmitC>(typeConverter, ctx);
+  patterns.add<PTOFillPadToEmitC, PTOFillPadExpandToEmitC>(typeConverter, ctx);
   patterns.add<PTOGatherToEmitC>(typeConverter, ctx);
   patterns.add<PTOGatherbToEmitC>(typeConverter, ctx);
   patterns.add<PTOMovFPToEmitC>(typeConverter, ctx);
@@ -7513,8 +7551,27 @@ struct EmitPTOManualPass
         return signalPassFailure();
     }
 
-    // 2. 配置转换目标
     PTOToEmitCTypeConverter typeConverter(ctx);
+
+    // 2. Pre-convert SCF structural op types (e.g. scf.if/scf.for results)
+    // using the same type converter. This avoids creating emitc.variable with
+    // unsupported types such as memref.
+    {
+      RewritePatternSet scfTypePatterns(ctx);
+      ConversionTarget scfTypeTarget(*ctx);
+      scf::populateSCFStructuralTypeConversionsAndLegality(
+          typeConverter, scfTypePatterns, scfTypeTarget);
+      scfTypeTarget.markUnknownOpDynamicallyLegal(
+          [](Operation *) { return true; });
+
+      if (failed(applyPartialConversion(mop, scfTypeTarget,
+                                        std::move(scfTypePatterns)))) {
+        mop.emitError("failed to reconcile SCF structural types");
+        return signalPassFailure();
+      }
+    }
+
+    // 3. 配置转换目标
     ConversionTarget target(*ctx);
 
     target.addIllegalDialect<memref::MemRefDialect>();
@@ -7550,14 +7607,14 @@ struct EmitPTOManualPass
     populatePTOToEmitCPatterns(patterns, typeConverter, ctx, *solver, targetArch);
     populateCallOpTypeConversionPattern(patterns, typeConverter);
 
-    // 3. 执行转换
+    // 4. 执行转换
     if (failed(applyPartialConversion(mop, target, std::move(patterns)))) {
       llvm::errs() << "Conversion FAILED! Rolling back executed.\n";
       return signalPassFailure();
     }
 
     // =========================================================================
-    // 4. [终极清理] 
+    // 5. [终极清理] 
     // 顺序至关重要：
     // Step A: 先移除所有 Cast，让 Loop 的 Operand 类型变成底层类型 (如 int32)
     // Step B: 再根据新的 Operand 类型，修复 Loop IV 的类型
@@ -7566,6 +7623,14 @@ struct EmitPTOManualPass
     // --- Step A: 清理 UnrealizedConversionCastOp ---
     // Prefer dropping redundant/unused casts; otherwise lower to emitc.cast
     // so the C++ emitter can print it.
+    auto isEmitCPointerLikeType = [](Type ty) {
+      if (isa<emitc::PointerType>(ty))
+        return true;
+      if (auto opaqueTy = dyn_cast<emitc::OpaqueType>(ty))
+        return opaqueTy.getValue().ends_with("*");
+      return false;
+    };
+
     llvm::SmallVector<UnrealizedConversionCastOp> castsToErase;
     bool castCleanupFailed = false;
     mop.walk([&](UnrealizedConversionCastOp cast) {
@@ -7589,6 +7654,15 @@ struct EmitPTOManualPass
       }
 
       if (inTy == outTy) {
+        output.replaceAllUsesWith(input);
+        castsToErase.push_back(cast);
+        return;
+      }
+
+      // SCF/CFG type conversion can transiently materialize pointer->memref
+      // bridge casts. At this stage, the producing value is already in the
+      // lowered EmitC pointer form; keep it and drop the bridge cast.
+      if (isEmitCPointerLikeType(inTy) && isa<BaseMemRefType>(outTy)) {
         output.replaceAllUsesWith(input);
         castsToErase.push_back(cast);
         return;
